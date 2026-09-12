@@ -1,0 +1,13 @@
+name: build
+
+on: [push, pull_request]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build (linux)
+        run: make linux
+      - name: strict warnings
+        run: make check

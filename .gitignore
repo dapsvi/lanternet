@@ -1,0 +1,9 @@
+# build artifacts
+lanternet
+lanternet-linux
+src/*.o
+
+# editor/OS noise
+*.swp
+*~
+.DS_Store

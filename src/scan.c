@@ -1,0 +1,323 @@
+/* scan.c - the host table, the ARP sweep, name probes, and orchestration */
+#include "lanternet.h"
+
+void add_host(unsigned int ip, const unsigned char *mac){
+    static const unsigned char none[6]={0,0,0,0,0,0};
+    static const unsigned char all6[6]={0xff,0xff,0xff,0xff,0xff,0xff};
+    /* /proc/net/arp keeps unresolved rows with a zero hardware address */
+    if(!mac || !memcmp(mac,none,6) || !memcmp(mac,all6,6)) return;
+    if(ip==g_myip) return;
+    for(int i=0;i<g_nhost;i++) if(g_hosts[i].ip==ip){ memcpy(g_hosts[i].mac,mac,6); return; }
+    if(g_nhost>=MAXHOST) return;
+    memset(&g_hosts[g_nhost],0,sizeof g_hosts[0]);
+    g_hosts[g_nhost].ip=ip;
+    memcpy(g_hosts[g_nhost].mac,mac,6);
+    g_nhost++;
+}
+
+int find_host(unsigned int ip){
+    for(int i=0;i<g_nhost;i++) if(g_hosts[i].ip==ip) return i;
+    return -1;
+}
+
+void host_set_name(int idx, const char *nm, int src){
+    if(idx<0 || !nm || !nm[0]) return;
+    if(src!=SRC_USER && name_is_junk(nm)) return;
+    size_t L=strlen(nm);
+    if(L>sizeof g_hosts[idx].name - 1) L=sizeof g_hosts[idx].name - 1;
+    memcpy(g_hosts[idx].name, nm, L);
+    g_hosts[idx].name[L]=0;
+    g_hosts[idx].name_src=src;
+}
+
+int recv_arp(int ms){
+    unsigned char buf[2048];
+    struct timeval tv; tv.tv_sec=0; tv.tv_usec=ms*1000;
+    fd_set fds; FD_ZERO(&fds); FD_SET(g_sock,&fds);
+    if(select(g_sock+1,&fds,NULL,NULL,&tv)<=0) return 0;
+    int n=recv(g_sock,buf,sizeof buf,0);
+    if(n<42) return 0;
+    if(buf[12]!=0x08||buf[13]!=0x06) return 0;
+    const struct arp_hdr *a=(const struct arp_hdr*)(buf+14);
+    if(ntohs(a->op)==2){ add_host(a->spa, a->sha); return 1; }
+    return 0;
+}
+
+static void discovery_pass(int ms){
+    int ns=socket(AF_INET,SOCK_DGRAM,0);
+    int md=mdns_open();
+    int ic=icmp_open();
+    int i6=icmp6_open();
+    unsigned short id=(unsigned short)(getpid()&0xffff);
+    for(int i=0;i<g_nhost;i++){
+        if(ns>=0) nbns_probe(ns,g_hosts[i].ip);
+        if(md>=0) mdns_reverse(md,g_hosts[i].ip);
+        if(ic>=0) icmp_echo(ic,g_hosts[i].ip,id);
+        if(i6>=0){ unsigned char ll[16]; eui64_ll(g_hosts[i].mac,ll); icmp6_echo(i6,ll,id); }
+    }
+    unsigned long end=now_ms()+ (unsigned long)ms;
+    while(now_ms()<end){
+        fd_set fds; FD_ZERO(&fds);
+        int maxfd=-1;
+        int fds_arr[4]={ns,md,ic,i6};
+        for(int k=0;k<4;k++) if(fds_arr[k]>=0){ FD_SET(fds_arr[k],&fds); if(fds_arr[k]>maxfd) maxfd=fds_arr[k]; }
+        if(maxfd<0) break;
+        struct timeval tv; tv.tv_sec=0; tv.tv_usec=200000;
+        int r=select(maxfd+1,&fds,NULL,NULL,&tv);
+        if(r<=0) continue;
+        if(ns>=0 && FD_ISSET(ns,&fds)){
+            unsigned char b[1024]; struct sockaddr_in from; socklen_t fl=sizeof from;
+            int n=recvfrom(ns,b,sizeof b,0,(struct sockaddr*)&from,&fl);
+            if(n>0) nbns_parse(b,n,from.sin_addr.s_addr);
+        }
+        if(md>=0 && FD_ISSET(md,&fds)){
+            unsigned char b[2048]; int n=recv(md,b,sizeof b,0);
+            if(n>0) mdns_parse(b,n);
+        }
+        if(ic>=0 && FD_ISSET(ic,&fds)) icmp_handle(ic);
+        if(i6>=0 && FD_ISSET(i6,&fds)) icmp6_handle(i6);
+    }
+    if(ns>=0) close(ns);
+    if(md>=0) close(md);
+    if(ic>=0) close(ic);
+    if(i6>=0) close(i6);
+}
+
+static void neigh_stream(FILE *f){
+    char line[512];
+    while(fgets(line,sizeof line,f)){
+        char ip[64]="", macs[32]="";
+        if(sscanf(line,"%63s",ip)!=1) continue;
+        char *l=strstr(line,"lladdr ");
+        if(l) sscanf(l+7,"%31s",macs);
+        if(!macs[0] || strstr(line,"FAILED") || strstr(line,"INCOMPLETE")) continue;
+        unsigned char mac[6];
+        if(!parse_mac(macs,mac)) continue;
+        unsigned int a;
+        if(inet_pton(AF_INET,ip,&a)==1){
+            add_host(a,mac);
+        } else if(strchr(ip,':')){                 /* IPv6 neighbour */
+            for(int i=0;i<g_nhost;i++) if(!memcmp(g_hosts[i].mac,mac,6)){
+                /* prefer a routable address over a link-local one */
+                if(!g_hosts[i].ip6[0] ||
+                   (!strncmp(g_hosts[i].ip6,"fe80",4) && strncmp(ip,"fe80",4)))
+                    snprintf(g_hosts[i].ip6,sizeof g_hosts[i].ip6,"%s",ip);
+                g_hosts[i].v6=1;
+                break;
+            }
+        }
+    }
+}
+
+void merge_neigh(void){
+    FILE *f=popen("ip neigh show 2>/dev/null","r");
+    if(f){ neigh_stream(f); pclose(f); }
+    FILE *g=popen("ip -6 neigh show 2>/dev/null","r");
+    if(g){ neigh_stream(g); pclose(g); }
+}
+
+static int host_cmp(const void *a,const void *b){
+    const struct host *x=a,*y=b;
+    unsigned int xi=ntohl(x->ip), yi=ntohl(y->ip);
+    return (xi>yi)-(xi<yi);
+}
+
+/* one "<ip> <type> <flags> <mac>" row of /proc/net/arp */
+static int arp_line(const char *line, unsigned int *ip, unsigned char *mac){
+    char ips[32], hws[32]; unsigned type, flags;
+    if(sscanf(line,"%31s %x %x %31s",ips,&type,&flags,hws)<4) return 0;
+    if(inet_pton(AF_INET,ips,ip)!=1) return 0;
+    return parse_mac(hws,mac);
+}
+
+int arp_from_file(unsigned int ip, unsigned char *out){
+    FILE *f=fopen("/proc/net/arp","r");
+    if(!f) return 0;
+    char line[256]; int first=1, ok=0;
+    while(fgets(line,sizeof line,f)){
+        if(first){ first=0; continue; }
+        unsigned int a; unsigned char mac[6];
+        if(arp_line(line,&a,mac) && a==ip){ memcpy(out,mac,6); ok=1; break; }
+    }
+    fclose(f);
+    return ok;
+}
+
+int arp_probe(unsigned int ip, unsigned char *out){
+    static const unsigned char bcast[6]={0xff,0xff,0xff,0xff,0xff,0xff};
+    static const unsigned char zero[6]={0,0,0,0,0,0};
+    for(int t=0;t<5;t++){
+        send_arp(1,bcast,g_myip,g_mymac,ip,zero);
+        for(int k=0;k<3;k++){
+            struct timeval tv; tv.tv_sec=0; tv.tv_usec=100000;
+            fd_set fds; FD_ZERO(&fds); FD_SET(g_sock,&fds);
+            if(select(g_sock+1,&fds,NULL,NULL,&tv)<=0) continue;
+            unsigned char buf[2048]; int n=recv(g_sock,buf,sizeof buf,0);
+            if(n>=42 && buf[12]==0x08 && buf[13]==0x06){
+                const struct arp_hdr *a=(const struct arp_hdr*)(buf+14);
+                if(ntohs(a->op)==2 && a->spa==ip){ memcpy(out,a->sha,6); return 1; }
+            }
+        }
+    }
+    return 0;
+}
+
+int resolve_ip(unsigned int ip, unsigned char *out){
+    int i=find_host(ip);
+    if(i>=0){ memcpy(out,g_hosts[i].mac,6); return 1; }
+    if(arp_from_file(ip,out)){ add_host(ip,out); return 1; }
+    if(arp_probe(ip,out)){ add_host(ip,out); return 1; }
+    return 0;
+}
+
+void load_gwmac(void){
+    for(int i=0;i<g_nhost;i++) if(g_hosts[i].ip==g_gwip){ memcpy(g_gwmac,g_hosts[i].mac,6); break; }
+    if(g_gwmac[0]||g_gwmac[1]) return;
+    if(arp_from_file(g_gwip,g_gwmac)) return;
+    static const unsigned char bcast[6]={0xff,0xff,0xff,0xff,0xff,0xff};
+    static const unsigned char zero[6]={0,0,0,0,0,0};
+    for(int t=0;t<10;t++){
+        send_arp(1,bcast,g_myip,g_mymac,g_gwip,zero);
+        struct timeval tv; tv.tv_sec=0; tv.tv_usec=200000;
+        fd_set fds; FD_ZERO(&fds); FD_SET(g_sock,&fds);
+        if(select(g_sock+1,&fds,NULL,NULL,&tv)>0){
+            unsigned char buf[2048]; int n=recv(g_sock,buf,sizeof buf,0);
+            if(n>=42 && buf[12]==0x08 && buf[13]==0x06){
+                const struct arp_hdr *a=(const struct arp_hdr*)(buf+14);
+                if(ntohs(a->op)==2 && a->spa==g_gwip){ memcpy(g_gwmac,a->sha,6); break; }
+            }
+        }
+    }
+}
+
+void rescan_hosts(void){
+    g_nhost=0;
+    scan();
+    load_gwmac();
+    if(g_do_v6) g_v6_ok = router_ll_from_route(g_router_ll);
+}
+
+/* One sweep of the subnet plus the local tables. Fills g_hosts, no name work. */
+void arp_sweep(void){
+    struct in_addr n,m; char ns[32],ms[32];
+    n.s_addr = g_myip & g_mask;
+    m.s_addr = g_mask;
+    inet_ntop(AF_INET,&n,ns,sizeof ns);
+    inet_ntop(AF_INET,&m,ms,sizeof ms);
+    unsigned int bcast = g_myip | ~g_mask;
+    unsigned int first = ntohl(n.s_addr) + 1;
+    unsigned int last  = ntohl(bcast) - 1;
+    if(last < first) last = first;
+    unsigned long total = (unsigned long)last - (unsigned long)first + 1;
+    unsigned long cap = g_scan_all ? 1000000UL : (unsigned long)SWEEP_CAP;
+    unsigned long cnt = total;
+    if(cnt > cap) cnt = cap;
+    if(!g_json){
+        if(total > cap)
+            printf("subnet %s/%s has %lu hosts; sweeping the first %lu (--all for everything)\n", ns, ms, total, cnt);
+        else
+            printf("subnet %s/%s (%lu hosts)\n", ns, ms, total);
+    }
+
+    static const unsigned char bcastmac[6]={0xff,0xff,0xff,0xff,0xff,0xff};
+    static const unsigned char zero6[6]={0,0,0,0,0,0};
+    for(unsigned long i=0;i<cnt;i++){
+        unsigned int tip = htonl(first + (unsigned int)i);
+        if(tip == g_myip) continue;
+        send_arp(1,bcastmac,g_myip,g_mymac,tip,zero6);
+        if((i & 63) == 63) usleep(1000);
+        /* Drain the socket between batches: on a big net a burst of replies
+           overflows the receive buffer and hosts are silently lost. */
+        if((i & (SWEEP_BATCH-1)) == (SWEEP_BATCH-1)){
+            for(int k=0;k<10000 && recv_arp(0);k++);
+            if(cnt > 512) usleep(3000);   /* big sweep: give the NIC a breather */
+        }
+    }
+    /* Drain until the wire is quiet, NOT a fixed packet count */
+    unsigned long wait_ms = 5000 + cnt/100;
+    if(wait_ms > 20000) wait_ms = 20000;
+    unsigned long deadline = now_ms() + wait_ms;
+    int quiet = 0;
+    while(now_ms() < deadline && quiet < ARP_QUIET_WIN){
+        if(recv_arp(200)) quiet = 0; else quiet++;
+    }
+
+    /* merge the kernel ARP table */
+    FILE *af=fopen("/proc/net/arp","r");
+    if(af){
+        char line[256]; int firstl=1;
+        while(fgets(line,sizeof line,af)){
+            if(firstl){ firstl=0; continue; }
+            unsigned int a; unsigned char mac[6];
+            if(arp_line(line,&a,mac)) add_host(a,mac);
+        }
+        fclose(af);
+    }
+
+    /* kernel neighbour table (v4+v6) + any local DHCP leases */
+    merge_neigh();
+    merge_dhcp_leases();
+
+    /* the gateway is a target too, even when it sits outside the swept range */
+    if(g_gwip && find_host(g_gwip)<0){ unsigned char gm[6]; resolve_ip(g_gwip,gm); }
+}
+
+void scan(void){
+    arp_sweep();
+
+    if(g_nhost>0) discovery_pass(2500);
+    if(g_nhost>0) dns_batch_ptr(1500);
+    if(g_nhost>0){ mdns_browse(); ssdp_probe(); }
+    if(g_nhost>0) dhcp_listen(3000);
+    if(g_nhost>0) cache_load();
+
+    /* enrich */
+    for(int i=0;i<g_nhost;i++){
+        const char *v=vendor_of(g_hosts[i].mac);
+        if(v && v[0] && !g_hosts[i].vendor[0])   /* keep a DHCP vendor class if we have one */
+            snprintf(g_hosts[i].vendor,sizeof g_hosts[i].vendor,"%s",v);
+        char saved[64];
+        if(name_lookup(g_hosts[i].mac,saved,sizeof saved)){
+            snprintf(g_hosts[i].name,sizeof g_hosts[i].name,"%s",saved);
+            g_hosts[i].name_src=1;
+        }
+    }
+    cache_save();
+    host_sort();
+    print_hosts();
+}
+
+void host_sort(void){ qsort(g_hosts,g_nhost,sizeof g_hosts[0],host_cmp); }
+
+/* Passive name harvest: listen for names, never touch the network state.
+   DHCP hostnames only appear when a device joins or rebinds, so a long
+   listen catches what a single scan window misses. */
+void listen_names(int secs){
+    arp_sweep();
+    cache_load();
+    char *seen=calloc(MAXHOST,1);
+    if(!seen) return;
+    if(!g_json)
+        printf("watching for names for %ds across %d hosts (Ctrl-C to stop)\n", secs, g_nhost);
+    time_t end=time(NULL)+secs;
+    int round=0;
+    while(time(NULL)<end){
+        dhcp_listen(2000);
+        round++;
+        if(round%2==0 && g_nhost>0){ mdns_browse(); dns_batch_ptr(1200); }
+        if(round%3==0 && g_nhost>0) ssdp_probe();
+        cache_load();
+        for(int i=0;i<g_nhost;i++){
+            if(seen[i] || !g_hosts[i].name[0]) continue;
+            seen[i]=1;
+            if(g_json) continue;
+            char ip[32]; struct in_addr a; a.s_addr=g_hosts[i].ip; inet_ntop(AF_INET,&a,ip,sizeof ip);
+            printf("  + %-15s %-28s (%s)\n", ip, g_hosts[i].name, name_source(g_hosts[i].name_src));
+            fflush(stdout);
+        }
+    }
+    free(seen);
+    cache_save();
+    host_sort();
+    print_hosts();
+}
