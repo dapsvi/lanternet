@@ -302,6 +302,9 @@ void listen_names(int secs){
     time_t end=time(NULL)+secs;
     int round=0;
     while(time(NULL)<end){
+#ifdef LANTERNET_APP
+        app_guard_check();
+#endif
         dhcp_listen(2000);
         round++;
         if(round%2==0 && g_nhost>0){ mdns_browse(); dns_batch_ptr(1200); }

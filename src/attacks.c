@@ -1,6 +1,64 @@
 /* attacks.c - the poison primitives plus state save/restore */
 #include "lanternet.h"
 
+#ifdef LANTERNET_APP
+static void ndp_announce_all(void);   /* defined below */
+
+/* The binary lives inside an APK, where there is no shell user to clean up after it, so:
+  - nothing detaches
+  - any signal, or the death of the app process given to --guard,
+  repairs the segment before exiting
+That makes an orphaned cut impossible: the worst case is a process
+that notices within one tick (700 ms) and puts things back. */
+volatile sig_atomic_t g_stop = 0;
+
+static void app_on_signal(int sig){ (void)sig; g_stop = 1; }
+
+void app_install_signals(void){
+    struct sigaction sa; memset(&sa,0,sizeof sa);
+    sa.sa_handler = app_on_signal;      /* just sets a flag; the loops poll it */
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGTERM,&sa,NULL);
+    sigaction(SIGINT, &sa,NULL);
+    sigaction(SIGHUP, &sa,NULL);
+    signal(SIGPIPE,SIG_IGN);
+}
+
+/* the app process we belong to is gone (killed, swiped away, OOM) */
+static int app_guard_dead(void){
+    if(g_guard_pid<=0) return 0;
+    char p[64];
+    snprintf(p,sizeof p,"/proc/%d",g_guard_pid);
+    return access(p,F_OK)!=0;
+}
+
+/* repair everything and leave. Called from the long-running loops only. */
+void app_cleanup_exit(const char *why){
+    static int busy=0;
+    if(busy) _exit(0);
+    busy=1;
+    signal(SIGTERM,SIG_IGN); signal(SIGINT,SIG_IGN); signal(SIGHUP,SIG_IGN);
+    printf("\nlanternet: %s - repairing and exiting\n", why);
+    fflush(stdout);
+    if(!g_gwmac[0] && !g_gwmac[1]) load_gwmac();
+    if(g_gwmac[0] || g_gwmac[1]){
+        for(int r=0;r<3;r++){
+            garp_announce(g_gwip,g_gwmac);
+            ndp_announce_all();
+            usleep(150000);
+        }
+    }
+    state_restore();
+    exit(0);
+}
+
+/* called once per loop tick */
+void app_guard_check(void){
+    if(g_stop)              app_cleanup_exit("stopped");
+    if(app_guard_dead())    app_cleanup_exit("app process is gone");
+}
+#endif
+
 void poison(const struct host *h, int cut){
     static const unsigned char zero[6]={0,0,0,0,0,0};
     const unsigned char *sender = g_use_fake ? g_fake_mac : g_mymac;

@@ -9,6 +9,7 @@ unsigned char g_mymac[6], g_gwmac[6], g_router_ll[16];
 unsigned int g_myip=0, g_gwip=0, g_mask=0;
 char g_ifname[64]="";
 int g_do_v4=1, g_do_v6=1, g_v6_ok=0, g_scan_all=0, g_dry=0, g_use_fake=0, g_json=0;
+int g_guard_pid=0;
 unsigned char g_fake_mac[6];
 
 #define ARGS_MAX 8
@@ -32,6 +33,7 @@ static void parse_args(int argc,char **argv,const char **cmd,const char **arg,in
         else if(!strcmp(a,"--all")) g_scan_all=1;
         else if(!strcmp(a,"--dry")) g_dry=1;
         else if(!strcmp(a,"--json")) g_json=1;
+        else if(!strcmp(a,"--guard") && i+1<argc) g_guard_pid=atoi(argv[++i]);
         else if(!strcmp(a,"--gw") && i+1<argc) inet_pton(AF_INET,argv[++i],&g_gwip);
         else if(!strcmp(a,"--fake-mac")){
             g_use_fake=1;
@@ -50,6 +52,9 @@ int main(int argc,char **argv){
     const char *cmd=NULL, *arg[ARGS_MAX]; int narg=0;
     parse_args(argc,argv,&cmd,arg,&narg);
     if(g_use_fake && !mac_is_set(g_fake_mac)) random_local_mac(g_fake_mac);
+#ifdef LANTERNET_APP
+    app_install_signals();
+#endif
 
     return cli_run(cmd,narg,arg);
 }

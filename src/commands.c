@@ -25,6 +25,7 @@ void cli_usage(void){
     printf("  sniffmac <mac> [s]       watch frames from a MAC\n");
     printf("  sniffarp [s]             dump visible ARP frames\n");
     printf("  flags: --v4 --v6 --all --dry --gw <ip> --fake-mac [aa:bb:..] --json\n");
+    printf("         --guard <pid>  (exit if that process dies; for app use)\n");
     printf("  flags may appear before or after the command; root is required\n");
 }
 
@@ -57,6 +58,16 @@ static void mark_all_cut(void){
     for(int i=0;i<g_nhost;i++) if(g_hosts[i].ip!=g_gwip) g_hosts[i].cut=1;
 }
 
+#ifdef LANTERNET_APP
+/* The app build never detaches: a process the app cannot see and cannot kill
+   is exactly the failure we are trying to avoid. The loops below run in the
+   foreground instead, guarded by --guard <pid> and by SIGTERM/SIGINT. */
+static void daemonize(const char *what){
+    (void)what;
+    fprintf(stderr,"background mode is not available in this build\n");
+    exit(1);
+}
+#else
 static void daemonize(const char *what){
     pid_t p=fork();
     if(p<0){ perror("fork"); exit(1); }
@@ -67,6 +78,7 @@ static void daemonize(const char *what){
     FILE *pf=fopen(PID_FILE,"w");
     if(pf){ fprintf(pf,"%d\n",(int)getpid()); fclose(pf); }
 }
+#endif
 
 /* keep every known host cut, refreshing at the poison cadence */
 static void loop_all(int rescan_secs){
@@ -74,12 +86,16 @@ static void loop_all(int rescan_secs){
     mark_all_cut();
     time_t last=time(NULL);
     for(;;){
+#ifdef LANTERNET_APP
+        app_guard_check();
+#endif
+        state_save();          /* record before poisoning: the guard can then
+                                  never see a cut host the state file misses */
         for(int i=0;i<g_nhost;i++) if(g_hosts[i].cut) poison(&g_hosts[i],1);
         self_keepalive();
         if(rescan_secs>0 && (time(NULL)-last)>=rescan_secs){
             rescan_hosts(); mark_all_cut(); last=time(NULL);
         }
-        state_save();
         usleep(TICK_US);
     }
 }
@@ -89,6 +105,9 @@ static void loop_auto(void){
     signal(SIGPIPE,SIG_IGN);
     int linked=0; time_t last=0;
     for(;;){
+#ifdef LANTERNET_APP
+        app_guard_check();
+#endif
         if(g_sock<0 || !have_link()){
             if(linked) printf("network down, waiting to reconnect...\n");
             linked=0; sleep(2);
@@ -102,9 +121,9 @@ static void loop_auto(void){
         } else if(g_nhost==0 || (time(NULL)-last)>=20){
             rescan_hosts(); mark_all_cut(); last=time(NULL);
         }
+        state_save();          /* see the note in loop_all */
         for(int i=0;i<g_nhost;i++) if(g_hosts[i].cut) poison(&g_hosts[i],1);
         self_keepalive();
-        state_save();
         usleep(TICK_US);
     }
 }
@@ -228,11 +247,22 @@ static int cmd_sniffmac(int n,const char *a[]){
 
 static int cmd_sniffarp(int n,const char *a[]){ sniff_arp(n>0?atoi(a[0]):12); return 0; }
 
+/* TERM first so a running poison loop can repair, KILL only as a fallback */
+static void term_then_kill(int pid){
+    if(pid<=0 || pid==(int)getpid()) return;
+    if(kill(pid,SIGTERM)!=0) return;
+#ifdef LANTERNET_APP
+    for(int i=0;i<15;i++){ if(kill(pid,0)!=0) return; usleep(100000); }
+#endif
+    usleep(300000);
+    kill(pid,SIGKILL);
+}
+
 static int cmd_stop(int n,const char *a[]){
     (void)n; (void)a;
     int p=read_pidfile();
     if(p<=0){ printf("nothing to stop\n"); return 0; }
-    kill(p,SIGTERM); usleep(300000); kill(p,SIGKILL);
+    term_then_kill(p);
     remove(PID_FILE);
     printf("stopped background run (pid %d)\n", p);
     return 0;
@@ -251,7 +281,7 @@ static int cmd_stopall(int n,const char *a[]){
             char nm[32]; nm[0]=0;
             if(fgets(nm,sizeof nm,f)){
                 nm[strcspn(nm,"\n")]=0;
-                if(!strcmp(nm,"lanternet")||!strcmp(nm,"nclite")){ kill(pid,SIGKILL); killed++; }
+                if(!strcmp(nm,"lanternet")||!strcmp(nm,"nclite")||!strcmp(nm,"lanternet-app")){ term_then_kill(pid); killed++; }
             }
             fclose(f);
         }
@@ -313,9 +343,12 @@ static int cmd_hold(int n,const char *a[]){
     else printf("holding cut on %s (Ctrl-C to stop)\n", a[0]);
     g_hosts[idx].cut=1;
     for(;;){
+#ifdef LANTERNET_APP
+        app_guard_check();
+#endif
+        state_save();          /* see the note in loop_all */
         poison(&g_hosts[idx],1);
         self_keepalive();
-        state_save();
         usleep(TICK_US);
     }
 }

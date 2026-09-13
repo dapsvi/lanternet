@@ -1,6 +1,8 @@
 # build artifacts
 lanternet
 lanternet-linux
+lanternet-app
+lanternet-linux-app
 src/*.o
 
 # editor/OS noise

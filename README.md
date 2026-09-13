@@ -15,6 +15,7 @@ Made for GNU/Linux and Android (root).
 
     make             Linux binary  -> ./lanternet-linux
     make android     Android arm64 -> ./lanternet
+    make android-app Android arm64 -> ./lanternet-app   (the APK build, below)
     make check       recompile with a much stricter warning set
 
 `make android` needs an NDK. Anything from about r21 onwards works, since the
@@ -60,7 +61,26 @@ database.
 
 Everything except `stop` and `stopall` wants root. Flags can sit anywhere on
 the line: `--v4`, `--v6`, `--all`, `--gw <ip>`, `--fake-mac`, `--dry`,
-`--json`. Run it with no arguments for the same list.
+`--json`, `--guard <pid>`. Run it with no arguments for the same list.
+
+## The app build
+
+`make android-app` (or `make linux-app` to try it on the host) builds the same
+tool for use inside an app, where there is no shell user to clean up after it.
+Two differences:
+
+- Nothing detaches. `bg` is refused on `hold`, `holdall`, `daemon` and `auto`,
+  so the app can never leave behind a process it cannot see. The long-running
+  modes stay in the foreground.
+- `--guard <pid>` makes a long run watch a process and, if it disappears (the
+  app was killed, swiped away, or reclaimed by the low-memory killer), repair
+  the segment and exit. `SIGTERM` and `SIGINT` take the same path, so the app's
+  stop button puts the network back on the way out. Nothing is poisoned before
+  its state is recorded, so a guard exit can never leave a host cut.
+
+The state file is the shared `lanternet.state`, so `restore` and `stopall` still
+work from a shell. Point the app at its own copy of the binary,
+`/data/local/tmp/lanternet-app`, so it does not overwrite the CLI one.
 
 ## Scan output
 

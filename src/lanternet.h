@@ -118,6 +118,15 @@ extern unsigned int g_myip, g_gwip, g_mask;
 extern char g_ifname[64];
 extern int g_do_v4, g_do_v6, g_v6_ok, g_scan_all, g_dry, g_use_fake, g_json;
 extern unsigned char g_fake_mac[6];
+extern int g_guard_pid;              /* --guard: exit when this pid disappears */
+
+#ifdef LANTERNET_APP
+/* app build: no background modes, and every long run repairs on the way out */
+extern volatile sig_atomic_t g_stop;
+void app_install_signals(void);
+void app_guard_check(void);
+void app_cleanup_exit(const char *why) __attribute__((noreturn));
+#endif
 
 /* util.c */
 void mac_str(const unsigned char *, char *);
