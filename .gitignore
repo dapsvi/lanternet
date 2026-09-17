@@ -4,8 +4,8 @@ lanternet-linux
 lanternet-app
 lanternet-linux-app
 src/*.o
-
 # editor/OS noise
 *.swp
 *~
 .DS_Store
+android/app/src/main/jniLibs/arm64-v8a/liblanternet.so

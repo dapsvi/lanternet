@@ -257,10 +257,6 @@ void cache_save(void);
 /* device.c */
 int  self_device_name(char *out, int n);
 
-/* json.c */
-void print_hosts(void);
-const char *name_source(int src);
-
 /* attacks.c */
 void poison(const struct host *);
 void self_keepalive(void);

@@ -319,6 +319,8 @@ static void dispatch(const char *line, jbuf *o){
     }
 
     else if(!strcmp(cmd,"list")){
+        if(sel && !sel_valid(sel)) err="bad selector";
+        else {
         int c=0;
         for(int i=0;i<g_nhost;i++) if(host_matches_state(&g_hosts[i],state)&&sel_match(&g_hosts[i],sel)) c++;
         jb_raw(&r,"{\"count\":"); jb_printf(&r,"%d,\"hosts\":[",c);
@@ -330,6 +332,7 @@ static void dispatch(const char *line, jbuf *o){
             host_json(&r,&g_hosts[i]); first=0;
         }
         jb_raw(&r,"]}");
+        }
     }
 
     else if(!strcmp(cmd,"cut")){
