@@ -48,7 +48,7 @@
 #include <net/ethernet.h>
 #include <ifaddrs.h>
 
-#define LANTERNET_VERSION "0.1.0"
+#define LANTERNET_VERSION "1.0.0"
 #define MAXHOST 4096
 #ifdef __ANDROID__
 #define RUNDIR     "/data/local/tmp"
