@@ -10,12 +10,10 @@ void nbns_probe(int fd, unsigned int ip){
     q[45]=0x00; q[46]=0x00; q[47]=0x21; q[48]=0x00; q[49]=0x01;
     struct sockaddr_in d; memset(&d,0,sizeof d);
     d.sin_family=AF_INET; d.sin_port=htons(137); d.sin_addr.s_addr=ip;
+    if(g_dry) return;
     sendto(fd,q,50,0,(struct sockaddr*)&d,sizeof d);
 }
 
-/* Read the workstation name out of a NBSTAT (node status) reply.
-   Replies may echo the question (qd=1) or not (qd=0) - count both sections
-   instead of assuming one question and one answer, or the name table shifts. */
 static void nbstat_names(const unsigned char *r,int rdl,unsigned int from);
 
 void nbns_parse(const unsigned char *p,int n,unsigned int from){

@@ -115,6 +115,16 @@ static void dhcp_ingest(const unsigned char *p,int n){
     }
 }
 
+/* the server enrich step drives this socket */
+int dhcp_sock_open(void){ return dhcp_open(); }
+
+void dhcp_recv(int s){
+    if(s<0) return;
+    unsigned char b[2048];
+    int n=recv(s,b,sizeof b,0);
+    if(n>0) dhcp_ingest(b,n);
+}
+
 void dhcp_listen(int ms){
     int s=dhcp_open();
     if(s<0) return;
@@ -123,9 +133,7 @@ void dhcp_listen(int ms){
         struct timeval tv={0,200000};
         fd_set fds; FD_ZERO(&fds); FD_SET(s,&fds);
         if(select(s+1,&fds,NULL,NULL,&tv)<=0) continue;
-        unsigned char b[2048];
-        int n=recv(s,b,sizeof b,0);
-        if(n>0) dhcp_ingest(b,n);
+        dhcp_recv(s);
     }
     close(s);
 }

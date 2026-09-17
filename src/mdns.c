@@ -39,6 +39,7 @@ void mdns_reverse(int s, unsigned int ip){
     struct sockaddr_in d; memset(&d,0,sizeof d);
     d.sin_family=AF_INET; d.sin_port=htons(5353);
     inet_pton(AF_INET,"224.0.0.251",&d.sin_addr);
+    if(g_dry) return;
     sendto(s,b,q,0,(struct sockaddr*)&d,sizeof d);
 }
 
@@ -147,6 +148,7 @@ static void mdns_send(int s,const char *name,int type){
     struct sockaddr_in d; memset(&d,0,sizeof d);
     d.sin_family=AF_INET; d.sin_port=htons(5353);
     inet_pton(AF_INET,"224.0.0.251",&d.sin_addr);
+    if(g_dry) return;
     sendto(s,q,qn,0,(struct sockaddr*)&d,sizeof d);
 }
 
@@ -162,27 +164,32 @@ static void mdns_collect(int s,int ms){
     }
 }
 
-void mdns_browse(void){
-    int s=mdns_open();
+void mdns_browse_stage(int s,int stage){
     if(s<0) return;
-
-    mdns_send(s,"_services._dns-sd._udp.local",12);
-    mdns_collect(s,600);
-    int nt=mdns_ntype;
-    for(int i=0;i<nt && i<12;i++) mdns_send(s,mdns_type[i],12);
-    mdns_collect(s,1000);
-    for(int i=0;i<mdns_ninst;i++){
-        mdns_send(s,mdns_inst[i].full,33);
-        mdns_send(s,mdns_inst[i].full,16);
+    switch(stage){
+    case 0:
+        mdns_send(s,"_services._dns-sd._udp.local",12);
+        break;
+    case 1:
+        for(int i=0;i<mdns_ntype && i<12;i++) mdns_send(s,mdns_type[i],12);
+        break;
+    case 2:
+        for(int i=0;i<mdns_ninst;i++){
+            mdns_send(s,mdns_inst[i].full,33);
+            mdns_send(s,mdns_inst[i].full,16);
+        }
+        break;
+    case 3:
+        for(int i=0;i<mdns_ninst;i++){
+            if(!mdns_inst[i].host[0]) continue;
+            mdns_send(s,mdns_inst[i].host,1);
+        }
+        break;
     }
-    mdns_collect(s,1000);
-    for(int i=0;i<mdns_ninst;i++){
-        if(!mdns_inst[i].host[0]) continue;
-        mdns_send(s,mdns_inst[i].host,1);
-    }
-    mdns_collect(s,700);
-    close(s);
+}
 
+/* turn collected instances plus A records into host names */
+void mdns_browse_finish(void){
     for(int i=0;i<mdns_ninst;i++){
         if(!mdns_inst[i].host[0]) continue;
         unsigned int ip=0; int found=0;
@@ -199,4 +206,21 @@ void mdns_browse(void){
         }
         if(nm[0]) host_set_name(hi,nm,6);
     }
+}
+
+void mdns_browse(void){
+    int s=mdns_open();
+    if(s<0) return;
+
+    mdns_browse_stage(s,0);
+    mdns_collect(s,600);
+    mdns_browse_stage(s,1);
+    mdns_collect(s,1000);
+    mdns_browse_stage(s,2);
+    mdns_collect(s,1000);
+    mdns_browse_stage(s,3);
+    mdns_collect(s,700);
+    close(s);
+
+    mdns_browse_finish();
 }

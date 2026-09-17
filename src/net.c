@@ -85,7 +85,13 @@ int open_raw(void){
     int s = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ARP));
     if(s<0) return -1;
     int rb = 4*1024*1024;   /* hundreds of ARP replies must fit, or they drop */
+    setsockopt(s, SOL_SOCKET, SO_RCVBUFFORCE, &rb, sizeof rb);
     setsockopt(s, SOL_SOCKET, SO_RCVBUF, &rb, sizeof rb);
+    int sb = 1*1024*1024;   /* a full TX ring must never wedge the loop */
+    setsockopt(s, SOL_SOCKET, SO_SNDBUF, &sb, sizeof sb);
+    struct timeval tv; tv.tv_sec=0; tv.tv_usec=80000;   /* and never block */
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+    int fl=fcntl(s,F_GETFL,0); fcntl(s,F_SETFL,fl|O_NONBLOCK);
     struct sockaddr_ll sll; memset(&sll,0,sizeof sll);
     sll.sll_family=AF_PACKET; sll.sll_protocol=htons(ETH_P_ARP); sll.sll_ifindex=g_ifidx;
     if(bind(s,(struct sockaddr*)&sll,sizeof sll)<0){ close(s); return -1; }

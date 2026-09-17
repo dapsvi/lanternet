@@ -13,6 +13,7 @@
 CC      ?= cc
 CFLAGS  ?= -O2 -Wall -Wextra -Wshadow
 LDFLAGS ?=
+LDLIBS  ?= -lncursesw
 
 # ---- Android NDK (only needed for `make android`) ----
 # Probed in this order, first hit wins. Override with ANDROID_NDK_ROOT / NDKBIN.
@@ -31,17 +32,15 @@ OBJ     := $(SRC:.c=.o)
 
 LINUX   := lanternet-linux
 ANDROID := lanternet
-APP     := lanternet-app
-LINUXAPP:= lanternet-linux-app
 
-.PHONY: all linux android android-app linux-app clean check
+.PHONY: all linux android clean check
 
 all: linux android
 
 linux: $(LINUX)
 
 $(LINUX): $(SRC) $(HDR)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(SRC)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(SRC) $(LDLIBS)
 
 android: $(ANDROID)
 
@@ -52,26 +51,7 @@ $(ANDROID): $(SRC) $(HDR)
 	  echo "            ~/Android/Sdk/ndk, ~/Library/Android/sdk/ndk, /opt/android-sdk/ndk"; \
 	  echo "  override:  make NDKBIN=/path/to/ndk/toolchains/llvm/prebuilt/<host>/bin android"; \
 	  exit 1; }
-	$(ANDROIDCC) $(CFLAGS) -o $@ $(SRC)
-
-# ---- app build: no background modes, repairs on signal or app death ----
-# This is the binary that gets packaged in the APK. Same tool, but every
-# long-running mode stays in the foreground and cleans up on the way out.
-
-android-app: $(APP)
-
-$(APP): $(SRC) $(HDR)
-	@command -v $(ANDROIDCC) >/dev/null 2>&1 || { \
-	  echo "android-app: no NDK toolchain found"; \
-	  echo "  override:  make NDKBIN=/path/to/ndk/toolchains/llvm/prebuilt/<host>/bin android-app"; \
-	  exit 1; }
-	$(ANDROIDCC) $(CFLAGS) -DLANTERNET_APP -o $@ $(SRC)
-
-# same flags, host compiler, for testing the app-mode behaviour locally
-linux-app: $(LINUXAPP)
-
-$(LINUXAPP): $(SRC) $(HDR)
-	$(CC) $(CFLAGS) -DLANTERNET_APP -o $@ $(SRC)
+	$(ANDROIDCC) $(CFLAGS) -DNO_CURSES -o $@ $(SRC)
 
 # Objdump-style target: the object list, handy for dependency debugging
 %.o: %.c $(HDR)
@@ -80,10 +60,7 @@ $(LINUXAPP): $(SRC) $(HDR)
 check: $(HDR)
 	@echo "compiling with extra warnings..."
 	@$(CC) -O2 -Wall -Wextra -Wshadow -Wformat=2 -Wcast-align -Wstrict-prototypes \
-		-o /dev/null $(SRC) && echo "clean"
-	@echo "compiling app build with extra warnings..."
-	@$(CC) -O2 -Wall -Wextra -Wshadow -Wformat=2 -Wcast-align -Wstrict-prototypes \
-		-DLANTERNET_APP -o /dev/null $(SRC) && echo "clean"
+		-o /dev/null $(SRC) $(LDLIBS) && echo "clean"
 
 clean:
-	rm -f $(OBJ) $(LINUX) $(ANDROID) $(APP) $(LINUXAPP)
+	rm -f $(OBJ) $(LINUX) $(ANDROID)

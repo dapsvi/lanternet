@@ -1,4 +1,4 @@
-/* scan.c - the host table, the ARP sweep, name probes, and orchestration */
+/* scan.c - the host table, the ARP sweep, and gateway resolution */
 #include "lanternet.h"
 
 void add_host(unsigned int ip, const unsigned char *mac){
@@ -39,48 +39,17 @@ int recv_arp(int ms){
     if(n<42) return 0;
     if(buf[12]!=0x08||buf[13]!=0x06) return 0;
     const struct arp_hdr *a=(const struct arp_hdr*)(buf+14);
-    if(ntohs(a->op)==2){ add_host(a->spa, a->sha); return 1; }
+    if(ntohs(a->op)==2){
+        add_host(a->spa,a->sha);
+        if(!(g_gwmac[0]||g_gwmac[1]) || a->spa==g_gwip || memcmp(a->sha,g_gwmac,6)) host_seen(a->spa);
+        return 1;
+    }
     return 0;
 }
 
-static void discovery_pass(int ms){
-    int ns=socket(AF_INET,SOCK_DGRAM,0);
-    int md=mdns_open();
-    int ic=icmp_open();
-    int i6=icmp6_open();
-    unsigned short id=(unsigned short)(getpid()&0xffff);
-    for(int i=0;i<g_nhost;i++){
-        if(ns>=0) nbns_probe(ns,g_hosts[i].ip);
-        if(md>=0) mdns_reverse(md,g_hosts[i].ip);
-        if(ic>=0) icmp_echo(ic,g_hosts[i].ip,id);
-        if(i6>=0){ unsigned char ll[16]; eui64_ll(g_hosts[i].mac,ll); icmp6_echo(i6,ll,id); }
-    }
-    unsigned long end=now_ms()+ (unsigned long)ms;
-    while(now_ms()<end){
-        fd_set fds; FD_ZERO(&fds);
-        int maxfd=-1;
-        int fds_arr[4]={ns,md,ic,i6};
-        for(int k=0;k<4;k++) if(fds_arr[k]>=0){ FD_SET(fds_arr[k],&fds); if(fds_arr[k]>maxfd) maxfd=fds_arr[k]; }
-        if(maxfd<0) break;
-        struct timeval tv; tv.tv_sec=0; tv.tv_usec=200000;
-        int r=select(maxfd+1,&fds,NULL,NULL,&tv);
-        if(r<=0) continue;
-        if(ns>=0 && FD_ISSET(ns,&fds)){
-            unsigned char b[1024]; struct sockaddr_in from; socklen_t fl=sizeof from;
-            int n=recvfrom(ns,b,sizeof b,0,(struct sockaddr*)&from,&fl);
-            if(n>0) nbns_parse(b,n,from.sin_addr.s_addr);
-        }
-        if(md>=0 && FD_ISSET(md,&fds)){
-            unsigned char b[2048]; int n=recv(md,b,sizeof b,0);
-            if(n>0) mdns_parse(b,n);
-        }
-        if(ic>=0 && FD_ISSET(ic,&fds)) icmp_handle(ic);
-        if(i6>=0 && FD_ISSET(i6,&fds)) icmp6_handle(i6);
-    }
-    if(ns>=0) close(ns);
-    if(md>=0) close(md);
-    if(ic>=0) close(ic);
-    if(i6>=0) close(i6);
+void host_seen(unsigned int ip){
+    int i=find_host(ip);
+    if(i>=0) g_hosts[i].seen_ms=now_ms();
 }
 
 static void neigh_stream(FILE *f){
@@ -114,12 +83,6 @@ void merge_neigh(void){
     if(f){ neigh_stream(f); pclose(f); }
     FILE *g=popen("ip -6 neigh show 2>/dev/null","r");
     if(g){ neigh_stream(g); pclose(g); }
-}
-
-static int host_cmp(const void *a,const void *b){
-    const struct host *x=a,*y=b;
-    unsigned int xi=ntohl(x->ip), yi=ntohl(y->ip);
-    return (xi>yi)-(xi<yi);
 }
 
 /* one "<ip> <type> <flags> <mac>" row of /proc/net/arp */
@@ -190,13 +153,6 @@ void load_gwmac(void){
     }
 }
 
-void rescan_hosts(void){
-    g_nhost=0;
-    scan();
-    load_gwmac();
-    if(g_do_v6) g_v6_ok = router_ll_from_route(g_router_ll);
-}
-
 /* One sweep of the subnet plus the local tables. Fills g_hosts, no name work. */
 void arp_sweep(void){
     struct in_addr n,m; char ns[32],ms[32];
@@ -209,15 +165,9 @@ void arp_sweep(void){
     unsigned int last  = ntohl(bcast) - 1;
     if(last < first) last = first;
     unsigned long total = (unsigned long)last - (unsigned long)first + 1;
-    unsigned long cap = g_scan_all ? 1000000UL : (unsigned long)SWEEP_CAP;
     unsigned long cnt = total;
-    if(cnt > cap) cnt = cap;
-    if(!g_json){
-        if(total > cap)
-            printf("subnet %s/%s has %lu hosts; sweeping the first %lu (--all for everything)\n", ns, ms, total, cnt);
-        else
-            printf("subnet %s/%s (%lu hosts)\n", ns, ms, total);
-    }
+    if(!g_json && !g_sweep_quiet)
+        printf("subnet %s/%s (%lu hosts)\n", ns, ms, cnt);
 
     static const unsigned char bcastmac[6]={0xff,0xff,0xff,0xff,0xff,0xff};
     static const unsigned char zero6[6]={0,0,0,0,0,0};
@@ -225,21 +175,17 @@ void arp_sweep(void){
         unsigned int tip = htonl(first + (unsigned int)i);
         if(tip == g_myip) continue;
         send_arp(1,bcastmac,g_myip,g_mymac,tip,zero6);
-        if((i & 63) == 63) usleep(1000);
-        /* Drain the socket between batches: on a big net a burst of replies
-           overflows the receive buffer and hosts are silently lost. */
-        if((i & (SWEEP_BATCH-1)) == (SWEEP_BATCH-1)){
+        if((i & (SWEEP_BATCH-1)) == (SWEEP_BATCH-1))
             for(int k=0;k<10000 && recv_arp(0);k++);
-            if(cnt > 512) usleep(3000);   /* big sweep: give the NIC a breather */
-        }
+        if((i & (SWEEP_PAUSE_EVERY-1)) == (SWEEP_PAUSE_EVERY-1)) usleep(SWEEP_PAUSE_US);
     }
-    /* Drain until the wire is quiet, NOT a fixed packet count */
-    unsigned long wait_ms = 5000 + cnt/100;
-    if(wait_ms > 20000) wait_ms = 20000;
-    unsigned long deadline = now_ms() + wait_ms;
-    int quiet = 0;
-    while(now_ms() < deadline && quiet < ARP_QUIET_WIN){
-        if(recv_arp(200)) quiet = 0; else quiet++;
+    /* Wait for replies only until the wire goes quiet */
+    unsigned long tail = SWEEP_TAIL_MAX_MS + cnt/64;
+    if(tail > 15000) tail = 15000;
+    unsigned long deadline = now_ms() + tail;
+    unsigned long lastrx = now_ms();
+    while(now_ms() < deadline && (now_ms() - lastrx) < SWEEP_QUIET_MS){
+        if(recv_arp(50)) lastrx = now_ms();
     }
 
     /* merge the kernel ARP table */
@@ -258,69 +204,10 @@ void arp_sweep(void){
     merge_neigh();
     merge_dhcp_leases();
 
+
     /* the gateway is a target too, even when it sits outside the swept range */
     if(g_gwip && find_host(g_gwip)<0){ unsigned char gm[6]; resolve_ip(g_gwip,gm); }
 }
 
-void scan(void){
-    arp_sweep();
 
-    if(g_nhost>0) discovery_pass(2500);
-    if(g_nhost>0) dns_batch_ptr(1500);
-    if(g_nhost>0){ mdns_browse(); ssdp_probe(); }
-    if(g_nhost>0) dhcp_listen(3000);
-    if(g_nhost>0) cache_load();
 
-    /* enrich */
-    for(int i=0;i<g_nhost;i++){
-        const char *v=vendor_of(g_hosts[i].mac);
-        if(v && v[0] && !g_hosts[i].vendor[0])   /* keep a DHCP vendor class if we have one */
-            snprintf(g_hosts[i].vendor,sizeof g_hosts[i].vendor,"%s",v);
-        char saved[64];
-        if(name_lookup(g_hosts[i].mac,saved,sizeof saved)){
-            snprintf(g_hosts[i].name,sizeof g_hosts[i].name,"%s",saved);
-            g_hosts[i].name_src=1;
-        }
-    }
-    cache_save();
-    host_sort();
-    print_hosts();
-}
-
-void host_sort(void){ qsort(g_hosts,g_nhost,sizeof g_hosts[0],host_cmp); }
-
-/* Passive name harvest: listen for names, never touch the network state.
-   DHCP hostnames only appear when a device joins or rebinds, so a long
-   listen catches what a single scan window misses. */
-void listen_names(int secs){
-    arp_sweep();
-    cache_load();
-    char *seen=calloc(MAXHOST,1);
-    if(!seen) return;
-    if(!g_json)
-        printf("watching for names for %ds across %d hosts (Ctrl-C to stop)\n", secs, g_nhost);
-    time_t end=time(NULL)+secs;
-    int round=0;
-    while(time(NULL)<end){
-#ifdef LANTERNET_APP
-        app_guard_check();
-#endif
-        dhcp_listen(2000);
-        round++;
-        if(round%2==0 && g_nhost>0){ mdns_browse(); dns_batch_ptr(1200); }
-        if(round%3==0 && g_nhost>0) ssdp_probe();
-        cache_load();
-        for(int i=0;i<g_nhost;i++){
-            if(seen[i] || !g_hosts[i].name[0]) continue;
-            seen[i]=1;
-            if(g_json) continue;
-            char ip[32]; struct in_addr a; a.s_addr=g_hosts[i].ip; inet_ntop(AF_INET,&a,ip,sizeof ip);
-            printf("  + %-15s %-28s (%s)\n", ip, g_hosts[i].name, name_source(g_hosts[i].name_src));
-            fflush(stdout);
-        }
-    }
-    free(seen);
-    cache_save();
-    host_sort();
-    print_hosts();
-}

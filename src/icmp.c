@@ -4,6 +4,9 @@
 int icmp_open(void){
     int s=socket(AF_INET,SOCK_RAW,IPPROTO_ICMP);
     if(s<0) return -1;
+    int rb=4*1024*1024;
+    setsockopt(s,SOL_SOCKET,SO_RCVBUFFORCE,&rb,sizeof rb);
+    setsockopt(s,SOL_SOCKET,SO_RCVBUF,&rb,sizeof rb);
     int on=1; setsockopt(s,IPPROTO_IP,IP_RECVTTL,&on,sizeof on);
     return s;
 }
@@ -17,6 +20,7 @@ void icmp_echo(int s,unsigned int ip,unsigned short id){
     b[2]=c>>8; b[3]=c&0xff;
     struct sockaddr_in d; memset(&d,0,sizeof d);
     d.sin_family=AF_INET; d.sin_addr.s_addr=ip;
+    if(g_dry) return;
     sendto(s,b,24,0,(struct sockaddr*)&d,sizeof d);
 }
 
@@ -37,7 +41,9 @@ void icmp_handle(int s){
     for(struct cmsghdr *c=CMSG_FIRSTHDR(&mh); c; c=CMSG_NXTHDR(&mh,c))
         if(c->cmsg_level==IPPROTO_IP && c->cmsg_type==IP_TTL) ttl=*(int*)CMSG_DATA(c);
     int hi=find_host(from.sin_addr.s_addr);
-    if(hi>=0 && ttl>0) g_hosts[hi].ttl=ttl;
+    if(hi<0) return;
+    if(ttl>0) g_hosts[hi].ttl=ttl;
+    host_seen(from.sin_addr.s_addr);
 }
 
 int icmp6_open(void){
@@ -55,6 +61,7 @@ void icmp6_echo(int s,const unsigned char *dst_ll,unsigned short id){
     struct sockaddr_in6 d; memset(&d,0,sizeof d);
     d.sin6_family=AF_INET6; d.sin6_scope_id=g_ifidx;
     memcpy(&d.sin6_addr,dst_ll,16);
+    if(g_dry) return;
     sendto(s,msg,24,0,(struct sockaddr*)&d,sizeof d);
 }
 

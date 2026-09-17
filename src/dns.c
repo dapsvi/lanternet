@@ -13,10 +13,17 @@ int dns_skip_name(const unsigned char *p,int n,int off){
 
 int dns_read_name(const unsigned char *p,int n,int off,char *out,int osz){
     int o=0, guard=0;
+    int ret=off, first=1;
     while(off<n && guard++<64){
         unsigned len=p[off];
-        if((len&0xc0)==0xc0){ if(off+1>=n) break; off=((len&0x3f)<<8)|p[off+1]; continue; }
-        if(len==0){ off++; break; }
+        if((len&0xc0)==0xc0){
+            if(first) ret=off+2;
+            if(off+1>=n) break;
+            off=((len&0x3f)<<8)|p[off+1];
+            first=0;
+            continue;
+        }
+        if(len==0){ if(first) ret=off+1; off++; break; }
         if(off+1+(int)len>n) break;
         if(o && o<osz-1) out[o++]='.';
         for(int i=0;i<(int)len && o<osz-1;i++){
@@ -24,9 +31,10 @@ int dns_read_name(const unsigned char *p,int n,int off,char *out,int osz){
             out[o++] = (char)c;
         }
         off += 1+len;
+        first=0;
     }
     if(o<osz) out[o]=0;
-    return off;
+    return ret;
 }
 
 int dns_enc_name(unsigned char *b,int max,const char *name){
@@ -68,11 +76,11 @@ unsigned int dns_server_addr(void){
     return g_gwip;
 }
 
-void dns_batch_ptr(int ms){
+/* Send one PTR query per unnamed host. Returns how many went out. */
+int dns_ptr_send(int s){
+    if(s<0) return 0;
     unsigned int srv = dns_server_addr();
-    if(!srv) return;
-    int s=socket(AF_INET,SOCK_DGRAM,0);
-    if(s<0) return;
+    if(!srv) return 0;
     struct sockaddr_in d; memset(&d,0,sizeof d);
     d.sin_family=AF_INET; d.sin_port=htons(53); d.sin_addr.s_addr=srv;
     unsigned char q[160];
@@ -90,44 +98,61 @@ void dns_batch_ptr(int ms){
         if(o<0) continue;
         int qn=12+o;
         q[qn++]=0; q[qn++]=12; q[qn++]=0; q[qn++]=1;   /* PTR IN */
+        if(g_dry) { sent++; continue; }
         sendto(s,q,qn,0,(struct sockaddr*)&d,sizeof d);
         sent++;
     }
-    if(!sent){ close(s); return; }
+    return sent;
+}
+
+/* One reply, if one is waiting. The id carries which host asked. */
+void dns_ptr_recv(int s){
+    if(s<0) return;
+    unsigned char b[1024];
+    int n=recv(s,b,sizeof b,0);
+    if(n<12) return;
+    int id=(b[0]<<8)|b[1];
+    if(id<1 || id>g_nhost) return;
+    int idx=id-1;
+    int qd=(b[4]<<8)|b[5], an=(b[6]<<8)|b[7];
+    if(an<1) return;
+    int off=12;
+    for(int k=0;k<qd;k++){ off=dns_skip_name(b,n,off); if(off<0) return; off+=4; }
+    for(int k=0;k<an && off+10<=n;k++){
+        char owner[128];
+        off=dns_read_name(b,n,off,owner,sizeof owner);
+        if(off<0||off+10>n) return;
+        int type=(b[off]<<8)|b[off+1];
+        off+=8;
+        int rdl=(b[off]<<8)|b[off+1]; off+=2;
+        if(off+rdl>n) return;
+        if(type==12){
+            char tgt[128]="";
+            dns_read_name(b,n,off,tgt,sizeof tgt);
+            char *dot=strstr(tgt,".local");
+            if(dot) *dot=0;
+            if(tgt[0] && !g_hosts[idx].name[0]) host_set_name(idx,tgt,4);
+            return;
+        }
+        off+=rdl;
+    }
+}
+
+int dns_ptr_open(void){
+    if(!dns_server_addr()) return -1;
+    return socket(AF_INET,SOCK_DGRAM,0);
+}
+
+void dns_batch_ptr(int ms){
+    int s=dns_ptr_open();
+    if(s<0) return;
+    if(!dns_ptr_send(s)){ close(s); return; }
     unsigned long end=now_ms()+(unsigned long)ms;
     while(now_ms()<end){
         struct timeval tv={0,150000};
         fd_set fds; FD_ZERO(&fds); FD_SET(s,&fds);
         if(select(s+1,&fds,NULL,NULL,&tv)<=0) continue;
-        unsigned char b[1024];
-        int n=recv(s,b,sizeof b,0);
-        if(n<12) continue;
-        int id=(b[0]<<8)|b[1];
-        if(id<1 || id>g_nhost) continue;
-        int idx=id-1;
-        int qd=(b[4]<<8)|b[5], an=(b[6]<<8)|b[7];
-        if(an<1) continue;
-        int off=12;
-        for(int k=0;k<qd;k++){ off=dns_skip_name(b,n,off); if(off<0) break; off+=4; }
-        if(off<0) continue;
-        for(int k=0;k<an && off+10<=n;k++){
-            char owner[128];
-            off=dns_read_name(b,n,off,owner,sizeof owner);
-            if(off<0||off+10>n) break;
-            int type=(b[off]<<8)|b[off+1];
-            off+=8;
-            int rdl=(b[off]<<8)|b[off+1]; off+=2;
-            if(off+rdl>n) break;
-            if(type==12){
-                char tgt[128]="";
-                dns_read_name(b,n,off,tgt,sizeof tgt);
-                char *dot=strstr(tgt,".local");
-                if(dot) *dot=0;
-                if(tgt[0] && !g_hosts[idx].name[0]) host_set_name(idx,tgt,4);
-                break;
-            }
-            off+=rdl;
-        }
+        dns_ptr_recv(s);
     }
     close(s);
 }

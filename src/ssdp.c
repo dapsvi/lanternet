@@ -49,9 +49,16 @@ static int http_get(const char *ip,int port,const char *path,char *out,int cap){
     return n>0;
 }
 
-void ssdp_probe(void){
+/* Locations are kept between the collect phase and the fetch phase */
+static char ssdp_ip[SSDP_MAX_LOC][32];
+static char ssdp_path[SSDP_MAX_LOC][128];
+static int  ssdp_port[SSDP_MAX_LOC];
+static int  ssdp_nl;
+
+/* open the socket and fire the M-SEARCH out; returns fd or -1 */
+int ssdp_open(void){
     int s=socket(AF_INET,SOCK_DGRAM,0);
-    if(s<0) return;
+    if(s<0) return -1;
     int on=1; setsockopt(s,SOL_SOCKET,SO_REUSEADDR,&on,sizeof on);
     unsigned char ttl=2; setsockopt(s,IPPROTO_IP,IP_MULTICAST_TTL,&ttl,sizeof ttl);
     struct sockaddr_in d; memset(&d,0,sizeof d);
@@ -60,56 +67,72 @@ void ssdp_probe(void){
     const char *m=
         "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n"
         "MAN: \"ssdp:discover\"\r\nMX: 2\r\nST: ssdp:all\r\n\r\n";
+    if(g_dry) return -1;
     sendto(s,m,strlen(m),0,(struct sockaddr*)&d,sizeof d);
     sendto(s,m,strlen(m),0,(struct sockaddr*)&d,sizeof d);
+    ssdp_nl=0;
+    return s;
+}
 
-    char locip[SSDP_MAX_LOC][32]; char locpath[SSDP_MAX_LOC][128]; int locport[SSDP_MAX_LOC]; int nl=0;
-    unsigned long end=now_ms()+2000;
-    while(now_ms()<end && nl<SSDP_MAX_LOC){
-        struct timeval tv={0,200000};
-        fd_set fds; FD_ZERO(&fds); FD_SET(s,&fds);
-        if(select(s+1,&fds,NULL,NULL,&tv)<=0) continue;
-        char b[2048]; struct sockaddr_in from; socklen_t fl=sizeof from;
-        int n=recvfrom(s,b,sizeof b-1,0,(struct sockaddr*)&from,&fl);
-        if(n<=0) continue;
-        b[n]=0;
-        const char *l=find_ci(b,"location:");
-        if(!l) continue;
-        l+=9;
-        while(*l==' ') l++;
-        const char *u=find_ci(l,"http://");
-        if(!u) continue;
-        u+=7;
-        char ipp[32]; int k=0;
-        while(u[k] && u[k]!=':' && u[k]!='/' && k<31){ ipp[k]=u[k]; k++; }
-        ipp[k]=0;
-        int pt=80;
-        if(u[k]==':') pt=atoi(u+k+1);
-        const char *p=strchr(u,'/');
-        if(!ipp[0] || !p || pt<=0 || pt>65535) continue;
-        int dup=0;
-        for(int j=0;j<nl;j++) if(!strcmp(locip[j],ipp)){ dup=1; break; }
-        if(dup) continue;
-        snprintf(locip[nl],sizeof locip[nl],"%s",ipp);
-        snprintf(locpath[nl],sizeof locpath[nl],"%s",p);
-        char *cr=strpbrk(locpath[nl],"\r\n");      /* header line ends here */
-        if(cr) *cr=0;
-        locport[nl]=pt;
-        nl++;
-    }
-    close(s);
+/* one reply: remember its LOCATION if it is new */
+void ssdp_recv(int s){
+    if(s<0) return;
+    char b[2048]; struct sockaddr_in from; socklen_t fl=sizeof from;
+    int n=recvfrom(s,b,sizeof b-1,0,(struct sockaddr*)&from,&fl);
+    if(n<=0) return;
+    b[n]=0;
+    const char *l=find_ci(b,"location:");
+    if(!l) return;
+    l+=9;
+    while(*l==' ') l++;
+    const char *u=find_ci(l,"http://");
+    if(!u) return;
+    u+=7;
+    char ipp[32]; int k=0;
+    while(u[k] && u[k]!=':' && u[k]!='/' && k<31){ ipp[k]=u[k]; k++; }
+    ipp[k]=0;
+    int pt=80;
+    if(u[k]==':') pt=atoi(u+k+1);
+    const char *p=strchr(u,'/');
+    if(!ipp[0] || !p || pt<=0 || pt>65535) return;
+    for(int j=0;j<ssdp_nl;j++) if(!strcmp(ssdp_ip[j],ipp)) return;
+    if(ssdp_nl>=SSDP_MAX_LOC) return;
+    snprintf(ssdp_ip[ssdp_nl],sizeof ssdp_ip[ssdp_nl],"%s",ipp);
+    snprintf(ssdp_path[ssdp_nl],sizeof ssdp_path[ssdp_nl],"%s",p);
+    char *cr=strpbrk(ssdp_path[ssdp_nl],"\r\n");      /* header line ends here */
+    if(cr) *cr=0;
+    ssdp_port[ssdp_nl]=pt;
+    ssdp_nl++;
+}
 
-    for(int i=0;i<nl;i++){
+/* fetch each description and label the host that gave it */
+void ssdp_finish(void){
+    for(int i=0;i<ssdp_nl;i++){
         char ip[32]; unsigned int a;
-        memcpy(ip,locip[i],sizeof ip); ip[sizeof ip-1]=0;
+        memcpy(ip,ssdp_ip[i],sizeof ip); ip[sizeof ip-1]=0;
         if(inet_pton(AF_INET,ip,&a)!=1) continue;
         int hi=find_host(a);
         if(hi<0 || g_hosts[hi].name[0]) continue;     /* only label known hosts */
         char body[8192], nm[128];
-        if(!http_get(ip,locport[i],locpath[i],body,sizeof body)) continue;
+        if(!http_get(ip,ssdp_port[i],ssdp_path[i],body,sizeof body)) continue;
         if(!xml_tag(body,"friendlyName",nm,sizeof nm)){
             if(!xml_tag(body,"modelName",nm,sizeof nm)) continue;
         }
         if(nm[0]) host_set_name(hi,nm,7);
     }
+    ssdp_nl=0;
+}
+
+void ssdp_probe(void){
+    int s=ssdp_open();
+    if(s<0) return;
+    unsigned long end=now_ms()+2000;
+    while(now_ms()<end && ssdp_nl<SSDP_MAX_LOC){
+        struct timeval tv={0,200000};
+        fd_set fds; FD_ZERO(&fds); FD_SET(s,&fds);
+        if(select(s+1,&fds,NULL,NULL,&tv)<=0) continue;
+        ssdp_recv(s);
+    }
+    close(s);
+    ssdp_finish();
 }

@@ -55,11 +55,14 @@
 #else
 #define RUNDIR     "/tmp"
 #endif
+#define SOCK_PATH  RUNDIR "/lanternet.sock"
+#define LOCK_PATH  RUNDIR "/lanternet.lock"
 #define NAMES_FILE RUNDIR "/lanternet.names"
-#define STATE_FILE RUNDIR "/lanternet.state"
-#define PID_FILE   RUNDIR "/lanternet.pid"
 #define CACHE_FILE RUNDIR "/lanternet.cache"
-#define TICK_US    700000            /* NetCut-compatible poison cadence */
+#define TICK_US    700000            /* loop tick: how often the schedule is checked */
+#define BURST_US   150000            /* gap inside the four-round cut/cutall burst */
+#define INTERVAL_MS 2000             /* default gap between re-poisons of one host */
+#define INTERVAL_MIN_MS 200      /* floor for --interval */
 
 /* name_src values: where a hostname came from */
 #define SRC_NONE   0
@@ -74,9 +77,17 @@
 #define SRC_CACHE  9
 
 /* tuning: the numbers that used to be bare in the code */
-#define SWEEP_CAP        1024       /* hosts per pass unless --all */
-#define SWEEP_BATCH      128        /* ARP sends between socket drains */
-#define ARP_QUIET_WIN    5          /* empty receive windows that end a sweep */
+#define SWEEP_IDLE_MS   30000       /* idle between background sweeps (be a good citizen) */
+#define ENRICH_MS        250        /* one name-probe step per this long, not per tick */
+#define ENRICH_PER          1       /* hosts probed per enrich step */
+#define SWEEP_BATCH       64        /* ARP sends between socket drains */
+#define SWEEP_PAUSE_EVERY 1024
+#define SWEEP_PAUSE_US  50000
+#define PING_PER_TICK      64
+#define HOST_ON_MS      60000
+#define SWEEP_TAIL_MAX_MS 2500      /* base cap on the post-sweep reply wait */
+#define SWEEP_QUIET_MS    400       /* stop the sweep after this long with no reply */
+#define SCAN_WINDOW_MS   3000       /* one shared window for every discovery socket */
 #define SSDP_MAX_LOC     16         /* SSDP LOCATION urls per probe */
 #define NAME_MAX_ENTRIES 512        /* names.c saved-name table */
 #define NAME_KEY_LEN     20         /* "aa:bb:cc:dd:ee:ff" + NUL */
@@ -86,6 +97,10 @@
 #define CONSOLE_DEFAULT  80
 #define DHCP_OPT_HOSTNAME 12        /* option 12 */
 #define DHCP_OPT_VENDOR   60        /* option 60 */
+
+#ifndef SO_RCVBUFFORCE
+#define SO_RCVBUFFORCE 32
+#endif
 
 struct host {
     unsigned int ip;
@@ -97,6 +112,9 @@ struct host {
     int  name_src;          /* one of SRC_* above */
     int  ttl;               /* ICMP TTL -> OS hint */
     int  v6;                /* answered ICMPv6 on its derived link-local */
+    unsigned long last_ms;  /* when this host was last poisoned */
+    int  held;              /* currently in the derived cut set */
+    unsigned long seen_ms;
 };
 
 /* ARP payload as it sits in the frame, 14 bytes into the Ethernet header */
@@ -116,17 +134,23 @@ extern int g_sock, g_ifidx;
 extern unsigned char g_mymac[6], g_gwmac[6], g_router_ll[16];
 extern unsigned int g_myip, g_gwip, g_mask;
 extern char g_ifname[64];
-extern int g_do_v4, g_do_v6, g_v6_ok, g_scan_all, g_dry, g_use_fake, g_json;
+extern int g_do_v4, g_do_v6, g_v6_ok, g_dry, g_use_fake, g_json;
+extern int g_sweep_quiet;            /* suppress the sweep banner (loop rescans) */
+extern unsigned long g_interval_ms;  /* re-poison the same host this often */
 extern unsigned char g_fake_mac[6];
 extern int g_guard_pid;              /* --guard: exit when this pid disappears */
 
-#ifdef LANTERNET_APP
-/* app build: no background modes, and every long run repairs on the way out */
+/* server tuning (read fresh every tick) */
+extern int g_rate_pps;               /* token-bucket ceiling, frames/sec */
+extern int g_scan_speed;             /* 0 slow, 1 fast, 2 paused */
+extern unsigned long g_frames;       /* frames sent since start */
+extern unsigned long g_drops;        /* frames the kernel refused (TX ring full) */
+
+/* discovery / name probes */
+extern int g_enrich;                     /* 1 = send mDNS/NBNS/ICMP name probes */
 extern volatile sig_atomic_t g_stop;
-void app_install_signals(void);
-void app_guard_check(void);
-void app_cleanup_exit(const char *why) __attribute__((noreturn));
-#endif
+extern int g_loop_active;            /* set while the server loop runs */
+void install_signals(void);
 
 /* util.c */
 void mac_str(const unsigned char *, char *);
@@ -160,27 +184,29 @@ void send_arp(int, const unsigned char *, unsigned int, const unsigned char *, u
 void eui64_ll(const unsigned char *, unsigned char ll[16]);
 int  router_ll_from_route(unsigned char ll[16]);
 void ndp_na(const unsigned char *, const unsigned char *, const unsigned char *, const unsigned char *, const unsigned char *, const unsigned char *);
-void ndp_poison(const struct host *, int);
+void ndp_poison(const struct host *);
 
-/* main.c / commands.c - the command line */
-void cli_usage(void);
-int  cli_run(const char *cmd, int narg, const char *arg[]);
+/* server.c / client.c / tui.c (the single-server redesign) */
+int  server_run(void);
+int  client_usage(void);
+int  client_send(const char *cmd, const char *sel, const char *state,
+                 int has_id, int id, const char *value, int print_json);
+char *rpc_raw(const char *request);   /* malloc'd response line or NULL */
+extern char g_rpc_err[160];           /* why the last rpc_raw failed */
+int  tui_run(void);
 
 /* scan.c */
 void add_host(unsigned int, const unsigned char *);
 int  find_host(unsigned int);
 void host_set_name(int idx, const char *name, int src);
 int  recv_arp(int ms);
+void host_seen(unsigned int ip);
 int  arp_from_file(unsigned int, unsigned char *);
 int  arp_probe(unsigned int, unsigned char *);
 int  resolve_ip(unsigned int, unsigned char *);
 void load_gwmac(void);
 void merge_neigh(void);
-void rescan_hosts(void);
-void host_sort(void);
 void arp_sweep(void);
-void scan(void);
-void listen_names(int secs);
 
 /* icmp.c */
 int  icmp_open(void);
@@ -199,11 +225,18 @@ int  mdns_open(void);
 void mdns_reverse(int s, unsigned int ip);
 void mdns_parse(const unsigned char *p, int n);
 void mdns_browse(void);
+void mdns_browse_stage(int s, int stage);
+void mdns_browse_finish(void);
 
 /* ssdp.c */
+int  ssdp_open(void);
+void ssdp_recv(int s);
+void ssdp_finish(void);
 void ssdp_probe(void);
 
 /* dhcp.c */
+int  dhcp_sock_open(void);
+void dhcp_recv(int s);
 void dhcp_listen(int ms);
 void merge_dhcp_leases(void);
 
@@ -212,6 +245,9 @@ int  dns_skip_name(const unsigned char *p, int n, int off);
 int  dns_read_name(const unsigned char *p, int n, int off, char *out, int osz);
 int  dns_enc_name(unsigned char *b, int max, const char *name);
 unsigned int dns_server_addr(void);
+int  dns_ptr_open(void);
+int  dns_ptr_send(int s);
+void dns_ptr_recv(int s);
 void dns_batch_ptr(int ms);
 
 /* cache.c */
@@ -226,13 +262,7 @@ void print_hosts(void);
 const char *name_source(int src);
 
 /* attacks.c */
-void poison(const struct host *, int);
+void poison(const struct host *);
 void self_keepalive(void);
-void state_save(void);
-void state_restore(void);
-void garp_announce(unsigned int, const unsigned char *);
-void fix_host(unsigned int, const unsigned char *);
-void restore_run(void);
-int  read_pidfile(void);
 
 #endif
